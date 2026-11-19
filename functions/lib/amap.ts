@@ -1,16 +1,17 @@
 import type { Category, Restaurant } from '../../src/types/restaurant'
+import type { ApiReason, ApiStage } from '../../src/types/query'
 
 export interface Env { AMAP_WEB_KEY?: string }
 export class ApiError extends Error {
-  constructor(public status: number, message: string) { super(message) }
+  constructor(public status: number, message: string, public reason?: ApiReason, public retryable = false) { super(message) }
 }
 export const json = (data: unknown, status = 200) => Response.json(data, {
   status,
   headers: { 'Cache-Control': 'no-store, private', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' },
 })
-export function errorResponse(error: unknown): Response {
-  return error instanceof ApiError ? json({ error: error.message }, error.status)
-    : json({ error: '餐厅服务暂时无法连接，请稍后重试。' }, 502)
+export function errorResponse(error: unknown, stage: ApiStage): Response {
+  return error instanceof ApiError ? json({ error: error.message, stage, reason: error.reason }, error.status)
+    : json({ error: '餐厅服务暂时无法连接，请稍后重试。', stage }, 502)
 }
 export function text(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null
@@ -61,25 +62,48 @@ export function normalizePoi(poi: Record<string, unknown>): Restaurant | null {
   }
 }
 
-export async function amap(path: string, params: Record<string, string>, env: Env): Promise<Record<string, unknown>> {
-  const key = env.AMAP_WEB_KEY?.trim()
-  if (!key || key === 'replace_with_your_amap_web_service_key') throw new ApiError(503, '餐厅服务尚未配置高德 Key，请联系站点维护者。')
-  const url = new URL(path, 'https://restapi.amap.com')
-  url.search = new URLSearchParams({ ...params, key, output: 'JSON' }).toString()
+const quotaCodes = new Set(['10003', '10004', '10014', '10015', '10019', '10020', '10021', '10029', '10044', '10045'])
+const quotaError = () => new ApiError(502, '高德请求配额或频率已达上限，请稍后重试。', 'quota')
+
+async function requestAmap(url: URL): Promise<Record<string, unknown>> {
+  const signal = AbortSignal.timeout(8000)
   let data: Record<string, unknown>
   try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(8000), cache: 'no-store' })
-    if (!response.ok) throw new Error('Upstream HTTP failure')
+    const response = await fetch(url, { signal, cache: 'no-store' })
+    if (!response.ok) {
+      if (response.status === 429) throw quotaError()
+      throw new ApiError(502, '高德服务返回异常，请稍后重试。', 'upstream-http', [502, 503, 504].includes(response.status))
+    }
     data = await response.json() as Record<string, unknown>
-  } catch {
-    throw new ApiError(502, '高德服务暂时无法连接或请求超时，请稍后重试。')
+  } catch (cause) {
+    if (cause instanceof ApiError) throw cause
+    if (signal.aborted) throw new ApiError(502, '等待高德响应超时，请稍后重试。', 'timeout', true)
+    if (cause instanceof SyntaxError) throw new ApiError(502, '高德服务返回的数据格式异常，请稍后重试。', 'invalid-response')
+    throw new ApiError(502, '暂时无法连接高德服务，请稍后重试。', 'network', true)
   }
   if (!data || data.status !== '1') {
     const code = data?.infocode
-    const message = code === '10003' || code === '10004' || code === '10021' || code === '10044'
-      ? '高德请求配额或频率已达上限，请稍后重试。'
-      : '高德查询失败，请维护者检查 Web 服务 Key、接口权限与配额。'
-    throw new ApiError(502, message)
+    if (typeof code === 'string' && quotaCodes.has(code)) throw quotaError()
+    if (code === '10016') throw new ApiError(502, '高德服务繁忙，请稍后重试。', 'upstream-busy')
+    throw new ApiError(502, '高德查询失败，请维护者检查 Web 服务 Key、接口权限与配额。', 'upstream-rejected')
   }
   return data
+}
+
+export function createAmapClient(env: Env) {
+  // Conversion and pagination share one retry per user request.
+  let retryAvailable = true
+  return async (path: string, params: Record<string, string>) => {
+    const key = env.AMAP_WEB_KEY?.trim()
+    if (!key || key === 'replace_with_your_amap_web_service_key') {
+      throw new ApiError(503, '餐厅服务尚未配置高德 Key，请联系站点维护者。', 'configuration')
+    }
+    const url = new URL(path, 'https://restapi.amap.com')
+    url.search = new URLSearchParams({ ...params, key, output: 'JSON' }).toString()
+    try { return await requestAmap(url) } catch (error) {
+      if (!(error instanceof ApiError) || !error.retryable || !retryAvailable) throw error
+      retryAvailable = false
+      return requestAmap(url)
+    }
+  }
 }

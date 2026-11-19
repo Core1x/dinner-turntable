@@ -1,8 +1,10 @@
-import { amap, ApiError, coordinateParam, coordinates, errorResponse, json, normalizePoi, type Env } from '../lib/amap'
+import { createAmapClient, ApiError, coordinateParam, coordinates, errorResponse, json, normalizePoi, type Env } from '../lib/amap'
+import type { ApiStage } from '../../src/types/query'
 import { dedupeRestaurants, filterRestaurants } from '../../src/utils/filter'
 import type { Category, Restaurant } from '../../src/types/restaurant'
 
 export const onRequestGet: PagesFunction<Env> = async ({ request, env }) => {
+  let stage: ApiStage = 'nearby-search'
   try {
     const params = new URL(request.url).searchParams
     let lng = coordinateParam(params, 'lng')
@@ -16,19 +18,22 @@ export const onRequestGet: PagesFunction<Env> = async ({ request, env }) => {
     if (!['all', 'chinese', 'fastfood', 'noodles', 'other'].includes(category)) throw new ApiError(400, '餐饮类别无效。')
     const page = params.get('page')
     if (page !== null && !['1', '2'].includes(page)) throw new ApiError(400, '页码只能为 1 或 2。')
+    const amap = createAmapClient(env)
     if (coordsys === 'wgs84') {
-      const converted = await amap('/v3/assistant/coordinate/convert', { locations: `${lng.toFixed(6)},${lat.toFixed(6)}`, coordsys: 'gps' }, env)
+      stage = 'coordinate-conversion'
+      const converted = await amap('/v3/assistant/coordinate/convert', { locations: `${lng.toFixed(6)},${lat.toFixed(6)}`, coordsys: 'gps' })
       const point = coordinates(converted.locations)
       if (!point) throw new ApiError(502, '高德坐标转换未返回有效位置，请重新定位。')
       ;({ lng, lat } = point)
     }
+    stage = 'nearby-search'
     const rows: Restaurant[] = []
     let lastPageSize = 0
     for (const pageNumber of page ? [Number(page)] : [1, 2]) {
       const result = await amap('/v5/place/around', {
         location: `${lng.toFixed(6)},${lat.toFixed(6)}`, radius: radiusText, types: '050000', sortrule: 'distance',
         page_size: '25', page_num: String(pageNumber), show_fields: 'business',
-      }, env)
+      })
       if (!Array.isArray(result.pois)) throw new ApiError(502, '高德餐厅数据格式异常，请稍后重试。')
       lastPageSize = result.pois.length
       for (const poi of result.pois.slice(0, 25)) {
@@ -46,5 +51,5 @@ export const onRequestGet: PagesFunction<Env> = async ({ request, env }) => {
       total: !page && lastPageSize === 0 && rows.length === 0 ? 0 : null,
       truncated: lastPageSize === 25,
     })
-  } catch (error) { return errorResponse(error) }
+  } catch (error) { return errorResponse(error, stage) }
 }

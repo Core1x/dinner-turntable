@@ -103,6 +103,28 @@ describe('Pages Functions', () => {
     const response = await geocode(context('/api/geocode?address=深圳市南山区科技园'))
     expect(await response.json()).toEqual({ locations: [{ label: '广东省深圳市南山区科技园', lng: 113.9, lat: 22.6, coordsys: 'gcj02' }] })
   })
+  it('retries a transient error once across conversion and nearby search, reporting the failed stage', async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 504 }))
+      .mockResolvedValueOnce(ok({ locations: '113.9,22.6' }))
+      .mockRejectedValue(new TypeError('private request details'))
+    vi.stubGlobal('fetch', fetch)
+    const response = await restaurants(context('/api/restaurants?lng=113&lat=22'))
+    expect(fetch).toHaveBeenCalledTimes(3)
+    expect(response.status).toBe(502)
+    expect(await response.json()).toMatchObject({ stage: 'nearby-search', reason: 'network' })
+  })
+  it.each([
+    ['10003', 'quota'], ['10019', 'quota'], ['10020', 'quota'], ['10016', 'upstream-busy'],
+  ])('reports Amap failure %s without immediately retrying or exposing upstream text', async (code, reason) => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ status: '0', infocode: code, info: 'secret' })))
+    vi.stubGlobal('fetch', fetch)
+    const response = await geocode(context('/api/geocode?address=test'))
+    const body = await response.json()
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(body).toMatchObject({ stage: 'address-search', reason })
+    expect(JSON.stringify(body)).not.toContain('secret')
+  })
   it('rejects empty and overlong geocoding addresses', async () => {
     expect((await geocode(context('/api/geocode?address='))).status).toBe(400)
     expect((await geocode(context(`/api/geocode?address=${'a'.repeat(201)}`))).status).toBe(400)

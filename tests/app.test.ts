@@ -75,4 +75,34 @@ describe('user flows', () => {
     expect(wrapper.text()).toContain('高德服务暂时不可用')
     expect(wrapper.findAll('[data-test=restaurant]')).toHaveLength(0)
   })
+  it('lets the user cancel a silent provider and immediately search an address', async () => {
+    let lateSuccess!: PositionCallback
+    vi.stubGlobal('navigator', { geolocation: { getCurrentPosition: (ok: PositionCallback) => { lateSuccess = ok } } })
+    const wrapper = render()
+    await wrapper.get('[data-test=locate]').trigger('click')
+    expect(wrapper.text()).toContain('正在获取设备位置')
+    await wrapper.get('[data-test=cancel-location]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[role=alert]').exists()).toBe(false)
+    expect(wrapper.get('[data-test=address]').attributes('disabled')).toBeUndefined()
+    await search(wrapper)
+    lateSuccess({ coords: { longitude: 0, latitude: 0, accuracy: 9999 } } as GeolocationPosition)
+    await flushPromises()
+    expect(wrapper.text()).toContain('测试搜索位置')
+    expect(wrapper.text()).not.toContain('9999')
+  })
+  it('identifies coordinate conversion failure after successful device location', async () => {
+    vi.stubGlobal('navigator', { geolocation: { getCurrentPosition: (ok: PositionCallback) =>
+      ok({ coords: { longitude: 113.918273, latitude: 22.6, accuracy: 12 } } as GeolocationPosition) } })
+    vi.stubGlobal('fetch', async () => new Response(JSON.stringify({
+      error: '高德连接超时', stage: 'coordinate-conversion', reason: 'timeout',
+    }), { status: 502 }))
+    const wrapper = render()
+    await wrapper.get('[data-test=locate]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[role=alert]').text()).toContain('坐标转换失败')
+    const details = wrapper.get('textarea').element.value
+    expect(details).toContain('coordinate-conversion / HTTP 502 / timeout')
+    expect(details).not.toContain('113.918273')
+  })
 })

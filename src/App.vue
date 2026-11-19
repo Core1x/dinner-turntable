@@ -8,6 +8,7 @@ import RestaurantWheel from './components/RestaurantWheel.vue'
 import ResultPanel from './components/ResultPanel.vue'
 import { geocodeAddress, searchRestaurants } from './services/restaurant'
 import { locate } from './services/location'
+import { QueryError } from './types/query'
 import { clearHistory, readHistory, saveHistory } from './services/history'
 import { dedupeRestaurants, filterRestaurants } from './utils/filter'
 import type { Category, Restaurant, SearchLocation } from './types/restaurant'
@@ -21,10 +22,16 @@ const category = ref<Category>('all')
 const budget = ref<number | null>(null)
 const limit = ref(8)
 const selectedKeys = ref<string[]>([])
-const busy = ref(false)
+type Stage = 'locating' | 'address' | 'nearby'
+const stage = ref<Stage | null>(null)
+const busy = computed(() => stage.value !== null)
+const stageLabels = { locating: '正在获取设备位置…', address: '正在查询地址…', nearby: '正在查询附近餐厅…' }
+const progress = computed(() => stage.value ? stageLabels[stage.value] : '')
+let locationController: AbortController | undefined
 const spinning = ref(false)
 const cooldown = ref(false)
 const error = ref('')
+const diagnostic = ref('')
 const notice = ref('')
 const searched = ref(false)
 const truncated = ref(false)
@@ -51,8 +58,12 @@ function coolDown() {
   clearTimeout(cooldownTimer)
   cooldownTimer = setTimeout(() => { cooldown.value = false }, 2000)
 }
-onBeforeUnmount(() => clearTimeout(cooldownTimer))
+onBeforeUnmount(() => {
+  locationController?.abort()
+  clearTimeout(cooldownTimer)
+})
 async function fetchNearby(point: SearchLocation) {
+  stage.value = 'nearby'
   location.value = point
   restaurants.value = []
   result.value = null
@@ -64,17 +75,37 @@ async function fetchNearby(point: SearchLocation) {
   truncated.value = response.truncated
   searched.value = true
 }
-async function query(action: () => Promise<void>) {
+async function query(initialStage: Stage, action: () => Promise<void>) {
   if (queryDisabled.value) return
-  busy.value = true
+  stage.value = initialStage
   error.value = ''
+  diagnostic.value = ''
   notice.value = ''
-  try { await action() } catch (cause) { error.value = cause instanceof Error ? cause.message : '查询失败，请稍后重试。' }
-  finally { busy.value = false; coolDown() }
+  try { await action() } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : '查询失败，请稍后重试。'
+    if (cause instanceof QueryError) diagnostic.value = cause.diagnostic
+  } finally {
+    if (stage.value !== 'locating') coolDown()
+    stage.value = null
+  }
 }
-function locateNearby() { void query(async () => { choices.value = []; await fetchNearby(await locate()) }) }
+function locateNearby() {
+  void query('locating', async () => {
+    choices.value = []
+    const controller = new AbortController()
+    locationController = controller
+    let point: SearchLocation
+    try { point = await locate(controller.signal) }
+    catch (cause) {
+      if (controller.signal.aborted) return
+      throw cause
+    }
+    finally { locationController = undefined }
+    if (!controller.signal.aborted) await fetchNearby(point)
+  })
+}
 function searchAddress(address: string) {
-  void query(async () => {
+  void query('address', async () => {
     choices.value = []
     const response = await geocodeAddress(address)
     choices.value = response.locations
@@ -83,8 +114,8 @@ function searchAddress(address: string) {
     else notice.value = '找到多个地址，请选择你想出发的地点。'
   })
 }
-function chooseLocation(point: SearchLocation) { void query(async () => { choices.value = []; await fetchNearby(point) }) }
-function refresh() { if (location.value) void query(() => fetchNearby(location.value!)) }
+function chooseLocation(point: SearchLocation) { void query('nearby', async () => { choices.value = []; await fetchNearby(point) }) }
+function refresh() { if (location.value) void query('nearby', () => fetchNearby(location.value!)) }
 function toggle(row: Restaurant) {
   if (locked.value) return
   const key = keyOf(row)
@@ -123,14 +154,19 @@ function historyDate(value: string) { return new Intl.DateTimeFormat('zh-CN', { 
     <main>
       <section class="intro"><div class="eyebrow"><span></span>一日三餐，偶尔随缘</div><h1>把纠结留给转盘，<br class="mobile-br" /><span>把好胃口留给今晚。</span></h1><p>发现附近真实餐厅，转一下，遇见今天的那一口。</p></section>
       <div class="workspace">
-        <aside class="setup-column"><LocationSelector :location="location" :busy="busy" :disabled="queryDisabled" :choices="choices" @locate="locateNearby" @search="searchAddress" @choose="chooseLocation" /><div class="panel-divider"></div><SearchFilters v-model:radius="radius" v-model:category="category" v-model:budget="budget" :disabled="locked" :can-refresh="!!location && !cooldown" :dirty="dirty" @refresh="refresh" /></aside>
+        <aside class="setup-column">
+          <LocationSelector :location="location" :radius="radius" :progress="progress" :locating="stage === 'locating'"
+            :disabled="queryDisabled" :choices="choices" :error="error" :diagnostic="diagnostic"
+            @locate="locateNearby" @cancel="locationController?.abort()" @dismiss="error = ''"
+            @search="searchAddress" @choose="chooseLocation" />
+          <div class="panel-divider"></div><SearchFilters v-model:radius="radius" v-model:category="category" v-model:budget="budget" :disabled="locked" :can-refresh="!!location && !cooldown" :dirty="dirty" @refresh="refresh" />
+        </aside>
         <section class="wheel-column"><div class="wheel-heading"><span class="little-label">TODAY'S LITTLE ADVENTURE</span><span class="equal-badge"><span class="tiny-dot"></span>公平随缘</span></div><div class="wheel-title"><h2>{{ spinning ? '美味正在靠近' : result ? '今晚，有着落了' : '今天的美味，由它决定' }}</h2><p>{{ spinning ? '指针停下的地方，就是今晚的目的地。' : '不用再说“随便”，让选择变得简单一点。' }}</p></div><RestaurantWheel ref="wheel" :restaurants="candidates" :disabled="busy || dirty" @spinning="spinning = $event" @result="showResult" /><div class="wheel-bottom"><span>真实餐厅</span><i>✦</i><span>等概率抽取</span><i>✦</i><span>好好吃饭</span></div></section>
       </div>
-      <div v-if="error" class="message error" role="alert"><AppIcon name="info" :size="19" /><span>{{ error }}</span><button aria-label="关闭错误提示" @click="error = ''"><AppIcon name="close" :size="17" /></button></div>
       <div v-if="notice" class="message notice" role="status"><AppIcon name="info" :size="19" /><span>{{ notice }}</span><button aria-label="关闭提示" @click="notice = ''"><AppIcon name="close" :size="17" /></button></div>
       <ResultPanel v-if="result && !spinning" :restaurant="result" :confirmed="confirmed" :disabled="locked || dirty" @confirm="confirmed = true" @again="wheel?.spin()" />
       <section class="candidates-panel" :aria-busy="busy"><div class="candidates-heading"><div><div class="section-heading"><span class="step">03</span><h2>今晚的候选名单</h2><span class="count-badge">{{ filtered.length }}</span></div><p>{{ searched ? `已找到 ${restaurants.length} 家真实餐厅，筛选后 ${filtered.length} 家；${candidates.length} 家已加入转盘。` : '先找到附近的餐厅，再把心动的小店放进转盘。' }}</p></div><div class="candidate-tools"><label for="candidate-count">转盘席位 <select id="candidate-count" v-model.number="limit" :disabled="locked"><option v-for="n in 11" :key="n" :value="n + 1">{{ n + 1 }} 家</option></select></label><button class="text-button" :disabled="locked || filtered.length < 2" @click="shuffleCandidates"><AppIcon name="shuffle" :size="16" />换一组</button></div></div>
-        <div v-if="busy" class="empty-state" role="status"><span class="loading-ring"></span><h3>正在寻找附近的美味</h3><p>真实餐厅正在赶来的路上，请稍候。</p></div>
+        <div v-if="busy" class="empty-state" role="status"><span class="loading-ring"></span><h3>{{ progress }}</h3></div>
         <div v-else-if="!filtered.length" class="empty-state"><span class="empty-icon"><AppIcon :name="searched ? 'bowl' : 'pin'" :size="29" /></span><h3>{{ searched ? '暂时没有符合条件的餐厅' : '好吃的，就在你附近' }}</h3><p>{{ searched ? '试试放宽预算、切换类别，或扩大范围后更新餐厅。' : '点击“定位附近餐厅”，或输入一个熟悉的地址。' }}</p><button v-if="searched && radius < 3000" class="text-button" :disabled="locked" @click="radius = radius === 500 ? 1000 : radius === 1000 ? 2000 : 3000">扩大搜索范围<AppIcon name="arrow" :size="16" /></button></div>
         <div v-else class="restaurant-grid"><RestaurantCard v-for="row in filtered" :key="keyOf(row)" :restaurant="row" :selected="selectedKeys.includes(keyOf(row))" :disabled="locked" :color="colors[Math.max(0, candidates.findIndex(item => keyOf(item) === keyOf(row))) % colors.length]!" @toggle="toggle(row)" /></div>
         <p v-if="searched" class="data-note">数据来自高德地图 · 最多获取附近最近 50 条{{ truncated ? '，可能还有更多结果，可缩小半径' : '' }} · 商家信息与实际情况可能有差异</p>
